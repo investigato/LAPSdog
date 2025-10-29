@@ -1,5 +1,7 @@
 # LAPSdog
 
+![LAPSdog](https://github.com/investigato/LAPSdog/blob/main/assets/LAPSdog.png?raw=true)
+
 Decrypt Windows LAPS passwords from LDAP using DPAPI-NG.
 
 ## What This Does
