@@ -19,6 +19,15 @@ You need:
 
 ## Installation
 
+Clone the repository and install the dependencies:
+
+```bash
+git clone https://github.com/investigato/LAPSdog.git
+cd LAPSdog
+```
+
+Then install the dependencies:
+
 ```bash
 uv sync
 ```
@@ -33,7 +42,7 @@ Set your Kerberos cache and run:
 
 ```bash
 export KRB5CCNAME=/path/to/your/cache.ccache
-python main.py --dc dc01.domain.com -b "OU=Computers,DC=domain,DC=com" -t COMPUTER-NAME
+uv run main.py --dc dc01.domain.com -b "OU=Computers,DC=domain,DC=com" -t COMPUTER-NAME
 ```
 
 ### With NTLM Credentials
@@ -41,7 +50,7 @@ python main.py --dc dc01.domain.com -b "OU=Computers,DC=domain,DC=com" -t COMPUT
 If you don't have Kerberos tickets:
 
 ```bash
-puv run main.py --dc dc01.domain.com -b "OU=Computers,DC=domain,DC=com" -t COMPUTER-NAME -u DOMAIN\\user -p password
+uv run main.py --dc dc01.domain.com -b "OU=Computers,DC=domain,DC=com" -t COMPUTER-NAME -u DOMAIN\\user -p password
 ```
 
 ### Search All Computers
