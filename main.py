@@ -7,7 +7,8 @@ import os
 from datetime import datetime
 
 import dpapi_ng
-from ldap3 import ALL, NTLM, SASL, Connection, Server
+import ldap
+import ldap.sasl
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -22,16 +23,27 @@ TARGET_ATTRIBUTES = [
 
 def create_kerberos_connection(domain_controller):
     """
-    Attempt to connect to LDAP using Kerberos authentication.
+    Attempt to connect to LDAP using Kerberos authentication with GSSAPI.
     Returns connection object on success, None on failure.
     """
-    server = Server(domain_controller, get_info=ALL)
     try:
-        connection = Connection(
-            server, authentication=SASL, sasl_mechanism="GSSAPI", auto_bind=True
-        )
+        # Initialize LDAP connection
+        conn = ldap.initialize(f"ldap://{domain_controller}")
+
+        # Set options for better compatibility
+        conn.set_option(ldap.OPT_REFERRALS, 0)
+        conn.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
+
+        # Bind using SASL GSSAPI - this automatically requests integrity checking
+        # Creates a GSSAPI auth object that uses credentials from KRB5CCNAME
+        auth = ldap.sasl.gssapi("")
+        conn.sasl_interactive_bind_s("", auth)
+
         logging.info("[*] Kerberos authentication successful")
-        return connection
+        return conn
+    except ldap.STRONG_AUTH_REQUIRED as error:
+        logging.debug(f"Kerberos bind failed with strongerAuthRequired: {error}")
+        return None
     except Exception as error:
         logging.debug(f"Kerberos authentication failed: {error}")
         return None
@@ -41,19 +53,23 @@ def create_ntlm_connection(domain_controller, username, password):
     """
     Connect to LDAP using NTLM authentication with provided credentials.
     Username is normalized to DOMAIN\\user format required by NTLM.
+    Note: python-ldap doesn't have built-in NTLM support, so this uses simple bind.
     """
     normalized_username = normalize_username_for_ntlm(username)
 
-    server = Server(domain_controller, get_info=ALL)
-    connection = Connection(
-        server,
-        user=normalized_username,
-        password=password,
-        authentication=NTLM,
-        auto_bind=True,
-    )
-    logging.info("[*] NTLM authentication successful")
-    return connection
+    try:
+        conn = ldap.initialize(f"ldap://{domain_controller}")
+        conn.set_option(ldap.OPT_REFERRALS, 0)
+        conn.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
+
+        # Simple bind with credentials
+        conn.simple_bind_s(normalized_username, password)
+
+        logging.info("[*] NTLM authentication successful")
+        return conn
+    except Exception as error:
+        logging.debug(f"NTLM authentication failed: {error}")
+        raise
 
 
 def normalize_username_for_ntlm(username):
@@ -71,24 +87,41 @@ def normalize_username_for_ntlm(username):
 
 
 def get_computer_entries(ldap_connection, search_base, computer_name=None):
+    """
+    Search for computer entries in LDAP.
+    Returns a list of dicts with 'dn' and 'attrs' keys.
+    """
     if computer_name:
         search_filter = f"(&(objectClass=computer)(cn={computer_name}))"
     else:
         search_filter = "(objectClass=computer)"
 
-    search_successful = ldap_connection.search(
-        search_base=search_base,
-        search_filter=search_filter,
-        attributes=TARGET_ATTRIBUTES,
-    )
+    try:
+        # Search with TARGET_ATTRIBUTES
+        results = ldap_connection.search_s(
+            search_base,
+            ldap.SCOPE_SUBTREE,
+            search_filter,
+            TARGET_ATTRIBUTES,
+        )
 
-    if not search_successful:
+        if not results:
+            search_description = (
+                f"computer '{computer_name}'" if computer_name else "any computers"
+            )
+            raise SystemExit(f"[!] No {search_description} found in LDAP")
+
+        # Convert results to list of dicts: [{'dn': dn, 'attrs': attrs}, ...]
+        entries = []
+        for dn, attrs in results:
+            entries.append({"dn": dn, "attrs": attrs})
+
+        return entries
+    except ldap.LDAPError as error:
         search_description = (
             f"computer '{computer_name}'" if computer_name else "any computers"
         )
-        raise SystemExit(f"[!] No {search_description} found in LDAP")
-
-    return ldap_connection.entries
+        raise SystemExit(f"[!] Failed to search for {search_description}: {error}")
 
 
 def strip_ldap_header(encrypted_blob):
@@ -260,20 +293,24 @@ def create_ldap_connection(domain_controller, username=None, password=None):
 
 
 def decrypt_attributes_from_entry(
-    entry, domain_controller, username=None, password=None
+    entry, domain_controller, username=None, password=None, include_history=False
 ):
     """
     Iterate through target attributes on an LDAP entry and attempt to decrypt
     or convert any binary values found.
+    If include_history is False, only return the first successfully decrypted result.
+    entry is a dict with 'dn' and 'attrs' keys (from python-ldap).
     """
     results = []
+    attrs = entry["attrs"]
 
     for attribute_name in TARGET_ATTRIBUTES:
-        if attribute_name not in entry.entry_attributes:
+        if attribute_name not in attrs:
             logging.debug(f"[*] Attribute {attribute_name} not found on entry")
             continue
 
-        attribute_values = entry[attribute_name].raw_values
+        # python-ldap returns attributes as lists of bytes
+        attribute_values = attrs[attribute_name]
 
         for index, value in enumerate(attribute_values):
             if not isinstance(value, (bytes, bytearray)):
@@ -298,6 +335,10 @@ def decrypt_attributes_from_entry(
 
                 results.append(result_entry)
                 logging.info(f"[+] Successfully decrypted {attribute_name}[{index}]")
+
+                # If history is not included, return after first successful decryption
+                if not include_history:
+                    return results
             else:
                 logging.info(
                     f"[-] Failed to decrypt {attribute_name}[{index}] (run with --debug for details)"
@@ -320,6 +361,12 @@ def main():
         help="Computer name to decrypt passwords for (if not specified, searches all computers)",
     )
     argument_parser.add_argument(
+        "-k",
+        "--kerberos",
+        action="store_true",
+        help="Use Kerberos authentication (default: False)",
+    )
+    argument_parser.add_argument(
         "-u",
         "--user",
         help="Username (accepts DOMAIN\\user, user@DOMAIN, or user format)",
@@ -336,12 +383,20 @@ def main():
         action="store_true",
         help="Show SPNEGO negotiation details",
     )
+    argument_parser.add_argument(
+        "--include-history",
+        action="store_true",
+        default=False,
+        help="Include all historical password blobs (default: false)",
+    )
 
     arguments = argument_parser.parse_args()
 
     configure_logging(arguments.debug, arguments.verbose_spnego)
     check_kerberos_config(arguments.user, arguments.password)
 
+    # Create a fresh connection right before searching
+    # This ensures the bind is still valid when we perform the search
     ldap_connection = create_ldap_connection(
         arguments.dc, arguments.user, arguments.password
     )
@@ -349,6 +404,9 @@ def main():
     computer_entries = get_computer_entries(
         ldap_connection, arguments.base, arguments.target
     )
+
+    # Close the connection after getting entries
+    ldap_connection.unbind_s()
 
     if arguments.target:
         logging.info(
@@ -360,15 +418,19 @@ def main():
     all_decryption_results = []
 
     for entry in computer_entries:
-        logging.info(f"[*] Processing computer: {entry.entry_dn}")
+        logging.info(f"[*] Processing computer: {entry['dn']}")
 
         decryption_results = decrypt_attributes_from_entry(
-            entry, arguments.dc, arguments.user, arguments.password
+            entry,
+            arguments.dc,
+            arguments.user,
+            arguments.password,
+            arguments.include_history,
         )
 
         if decryption_results:
             for result in decryption_results:
-                result["computer_dn"] = str(entry.entry_dn)
+                result["computer_dn"] = entry["dn"]
                 all_decryption_results.append(result)
 
     if not all_decryption_results:
